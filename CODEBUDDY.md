@@ -8,7 +8,7 @@
 
 - `src/detect/mod.rs`
   - `Agent` 枚举新增 `Codebuddy` 变体
-  - `Agent::ALL`（21→22）与 `Agent::SCREEN_MANIFEST_AGENTS`（19→20）加入该变体
+  - `Agent::ALL` 与 `Agent::SCREEN_MANIFEST_AGENTS` 数组加入该变体（常量长度同步 +1）。当前值：`ALL` = 24、`SCREEN_MANIFEST_AGENTS` = 22（含上游后续新增的 `Muse`）
   - `agent_label` → `"codebuddy"`、`interactive_agent_executable` → `"codebuddy"`
   - `lookup_agent` 增加 `"codebuddy"` 映射（识别运行中的 codebuddy 进程）
 - `src/detect/manifests/codebuddy.toml`（新增）
