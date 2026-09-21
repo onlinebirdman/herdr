@@ -110,36 +110,51 @@ any = [
 id = "confirm_dialog_blocked"
 state = "blocked"
 priority = 1200
-region = "after_last_horizontal_rule"
+region = "bottom_non_empty_lines(20)"
 visible_blocker = true
-# The interrupt-approval dialog replaces the input box, so its own footer rule
-# becomes the last horizontal rule and this region is exactly the dialog body.
-# Captured live from CodeBuddy 2.156.0 in default permission mode (rm -rf on a
-# scratch path):
+# CodeBuddy renders several confirm dialogs, and their chrome differs:
+#   - Bash / Read / Write / Edit use topBorderOnly, so their edges are plain
+#     "-" runs and the dialog lands in after_last_horizontal_rule.
+#   - Fetch, and the workspace-trust prompt, are enclosed in a full round
+#     border, so their edges start with the corner glyphs and are NOT
+#     horizontal rules at all. after_last_horizontal_rule then resolves to
+#     stale scrollback and misses the dialog entirely. Verified live for Fetch.
+# A fixed bottom window covers both shapes. It has to be tall: the bordered
+# dialogs pad their blank rows out to full width, so those count as non-empty
+# and the trust prompt needs 16 rows before its title comes into view.
+# Captured live from CodeBuddy 2.156.0:
 #    |  Do you want to proceed(High risk operation detected - requires confirmation every time)?
 #    |  > 1. Yes
 #    |    2. Yes, and don't ask again for session (shift + tab)
 #    |    3. No, and tell CodeBuddy what to do differently (escape)
-# The confirm title splices the risk reason in before the "?", so a literal
-# "do you want to proceed?" needle misses this high-risk shape entirely; match
-# the title family and require the numbered option block as the shape
-# condition. The option block is what keeps an idle pane or a transcript that
-# merely quotes the dialog from matching: in both cases this region holds only
-# the status line and the mode badge, never numbered options.
+#    |  Do you trust the files in this folder?
+#    |    > 1. Trust folder only (<dir>)
+#    |      2. Trust parent folder (<parent>/**)
+#    |      4. No, exit (escape)
+# The shape gate is a two-row signature taken from how the dialog actually
+# paints: exactly one option row carries the selection pointer while the others
+# are plain indented rows. Both branches allow one leading box-drawing bar
+# because the bordered dialogs prefix every row with "\x{2502}".
+# Requiring both rows is what separates a real dialog from prose or a markdown
+# blockquote that reproduces the wording: a blockquote marks EVERY row with
+# ">", so it has no plain indented row and fails this gate. Verified with
+# `herdr agent explain --file` on synthetic prose and blockquote screens.
 # Priority sits above osc_title_working (1100) because the title keeps writing
 # braille spinner frames while the dialog waits, which otherwise masks the
 # blocker. codex, grok, qwen, hermes, amp and letta raise an OSC-title blocker
 # above 1100 for the same reason.
 all = [
   { any = [
-    { line_regex = ['(?i)^\s*[>❯]?\s*1\.\s*yes\b'] },
-    { line_regex = ['(?i)^\s*[>❯]?\s*2\.\s*yes\b'] },
-    { line_regex = ['(?i)^\s*[>❯]?\s*3\.\s*no\b'] },
+    { line_regex = ['(?i)^\s*\x{2502}?\s*[>❯]\s*[1-9]\.\s*(?:yes|no|trust)\b'] },
+  ] },
+  { any = [
+    { line_regex = ['(?i)^\s*\x{2502}?\s+[1-9]\.\s*(?:yes|no|trust)\b'] },
   ] },
   { any = [
     { contains = ["do you want to"] },
     { contains = ["would you like to"] },
     { contains = ["about to delete"] },
+    { contains = ["do you trust the files in this folder"] },
   ] },
 ]
 

@@ -89,28 +89,51 @@ ZIG=/path/to/zig-0.16 cargo build --release
 
 ### 修复
 
-新增 `confirm_dialog_blocked`（priority **1200**，region `after_last_horizontal_rule`），用"编号选项行 `[>❯]?\s*[1-3]\.\s*(yes|no)`"作**形状条件**，再要求同屏出现标题族文案（`do you want to` / `would you like to` / `about to delete`）。
+新增 `confirm_dialog_blocked`（priority **1200**），三个门槛同时满足才命中：
 
-- 高优先级解决第 1 层。
-- 底部 region + 形状条件解决第 3 层：idle 时该 region 只有状态行和模式徽标，绝不会出现编号选项；所以正文里引用弹窗文案不会被误判。
-- 实测还顺带回答了先前挂起的疑问：弹窗期间输入框被替换、裸 `>` 消失，所以 `legacy_no_prompt_blocker` 的 `not` 守卫**不会**在弹窗期间误伤（实测该规则 `matched=true`）。把守卫从 `❯` 改成 `[>❯]` 是安全的。
+1. **region = `bottom_non_empty_lines(20)`**（底部固定行窗）。
+2. **两行形状签名**：一行带选中指针的编号选项（`[>❯]\s*[1-9]\.\s*(yes|no|trust)`），另一行是同样文案的**纯缩进**编号选项。两行正则都允许一个前导 `\x{2502}`，因为带边框的弹窗会给每行加竖线。
+3. **文案门槛**：同区域出现 `do you want to` / `would you like to` / `about to delete` / `do you trust the files in this folder`。
 
-### 验证结果
+为什么这么设计：
 
-| 场景 | 修复前 | 修复后 |
+- **高优先级**解决第 1 层（1100 掩蔽）。
+- **为什么不用 `after_last_horizontal_rule`**：我先用了这个 region，它在 Bash/Read/Write/Edit 上是对的，但实测 **Fetch 弹窗**和**工作区信任弹窗**是**完整圆角边框**（`╭─╮` / `╰─╯`），没有以 `─` 开头的行，该 region 于是落到陈旧的会话区、完全看不到弹窗。固定底部行窗对两种边框都成立。
+- **为什么是 20 行**：带边框的弹窗会把空行补齐到整宽，那些行算"非空"，所以信任弹窗要 16 行才够把标题纳入窗口。
+- **为什么需要"两行"签名**：只用"指针+编号"一行会误报。实测用 `herdr agent explain --file` 构造的 markdown 引用屏（worker 把弹窗逐行引用）**命中并误报成 blocked**，正是 firstmate 9/19 记的那个坑。真实弹窗只有被选中那行有指针、其余是空格缩进，而 markdown 引用每行都带 `>`，所以要求"指针行 + 无指针缩进行"同时存在就把它挡住了（见下方验证）。
+
+### 验证结果（全部实机触发）
+
+在临时 tab 里以 `--permission-mode default` 驱动真实 CodeBuddy 2.156.0，逐个触发并抓取：
+
+| 弹窗 | 实测 confirmTitle | 结果 |
 |---|---|---|
-| 弹窗停在 High risk Bash 确认 | `working`（matched `osc_title_working`） | **`blocked`**（matched `confirm_dialog_blocked`，1200 压过 1100） |
-| 按 Escape 拒绝后 | - | `idle`（`live_prompt_box` + `osc_title_idle`），弹窗规则不再命中 |
-| 2 个空闲 pane | `idle` | `idle`，弹窗规则 `matched=false` |
-| 2 个工作中 pane | `working` | `working`，弹窗规则 `matched=false` |
+| Bash（高风险） | `Do you want to proceed(High risk operation detected - requires confirmation every time)?` | `blocked` |
+| Read（读工作区外文件） | `Do you want to proceed?` | `blocked` |
+| Write | `Do you want to create write-probe.txt?` | `blocked` |
+| Edit | `Do you want to make this edit to target.txt?` | `blocked` |
+| Fetch | `Do you want to allow CodeBuddy to fetch this content?` | `blocked` |
+| 工作区信任（未信任目录启动） | `Do you trust the files in this folder?`（4 个选项） | `blocked` |
 
-拒绝后确认 `probe-rm` 目录仍存在（命令确实没执行）。验证走的是本地 override + `herdr server reload-agent-manifests` 热重载，验证完 override 已删除。
+其中 Fetch 与信任弹窗还额外做了修复前后对比：Fetch 在 `after_last_horizontal_rule` 版本下 `matched=false`、报 `working`；信任弹窗在补 `trust` 文案之前报 `idle` 且**无任何规则命中**。改用最终版本后两者都报 `blocked`。
 
-### 仍未验证
+顺带验证到位的：
 
-- 其它形态的弹窗：`Write`/`Edit` 用 `Do you want to create …?` / `Do you want to make this edit to …?`，`Fetch` 用 `Do you want to allow … to fetch this content?`，批量删除用 `This command is about to delete N items.`。这些标题不含 `do you want to` 的常规形态，但 `about to delete` 已覆盖批量删除；其余几种需要用同样的方法各触发一次确认。
-- 渲染 `Esc to cancel` 那一类菜单（`live_blocked_form` 覆盖的 agents / skills picker）在弹窗期间是否也被 1100 掩蔽，未验证。
-- 工作区信任弹窗（`Do you trust the files in this folder`）未触发过 - 本次实验用的是已信任路径。
-- `dynamic_workflow_prompt`、`model_picker_menu`、`transcript_viewer` 仍未做过实机触发验证。
+- `ctrl+o` 打开详细 transcript → **`transcript_viewer` 命中**，state `unknown`（skip_state_update），符合预期。
+- 弹窗期间输入框被替换、裸 `>` 消失，`legacy_no_prompt_blocker` 的 `not` 守卫**不会**误伤（实测该规则在弹窗期间 `matched=true`）。把守卫从 `❯` 改成 `[>❯]` 是安全的。
+- 按 Escape 拒绝后回到 `idle`，且命令确实没执行（探针目录仍在）。
+
+反向（误报）验证：
+
+- 构造 `prose.txt`（正文里引用弹窗文案）与 `blockquote.txt`（markdown 逐行引用整个弹窗）→ 两者在新规则下 `matched=false`，state 保持 `working`。加"两行签名"之前 `blockquote.txt` 会误报成 `blocked`。
+- 同期全部 8 个真实 codebuddy pane：1 个停在信任弹窗的报 `blocked`，其余 7 个（含 working 与 idle）`confirm_dialog_blocked` 全部 `matched=false`，状态不变。
+
+### 触发不到、以及已知的 no-op
+
+- **Multi Edit**：本版本该模型没有 `MultiEdit` 工具（模型自己这么回答），构造不出来。
+- **批量删除**（`This command is about to delete N items.`）：该弹窗来自 `codebuddy.ai/interceptType: bulk-delete-threshold` 的 hook 元数据，而当前 `~/.codebuddy/settings.json` 只配了 429 告警 hook，所以触发不了。`about to delete` 已写进文案门槛作为前向兼容。
+- **`dynamic_workflow_prompt`**：未触发。
+- **菜单类是 no-op**：实测 `/model` 页脚是 `Enter to apply model · Tab to switch scope · Esc to exit`，`/agents` 是 `Press ↑↓ to navigate · Enter to select · Esc to go back`，`/skills` 是 `Esc to go back`。这些与 `model_picker_menu`（要 `select model` / `enter to set as default` / `esc to cancel`）和 `live_blocked_form`（要 `esc to cancel`）的 Claude 文案都不符，所以两条规则对这几个菜单不命中。考虑到菜单是用户主动打开的、且标题与输入框仍能给出合理状态，暂不改动文案。注意 bundle 里确实存在渲染 `Esc to cancel` 的 CodeBuddy 菜单（例如 `DELETE_CONFIRM` 的 `Press ↑↓ to navigate, Enter to select, Esc to cancel`），所以 `live_blocked_form` 并非死配置，只是本次没走到那个分支。
+- **限流**：探针账号在 2026-09-21 19:20 前后命中 429（`2026-09-22 18:31` 重置），之后任何需要模型的动作都做不了；上述菜单、信任弹窗、transcript 是纯 TUI，不受影响，所以照常测完。
 
 
