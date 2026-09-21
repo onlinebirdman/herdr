@@ -24,6 +24,9 @@ use crate::ipc::{
 
 mod pane_graphics_stream;
 
+#[cfg(test)]
+mod subscription_socket_tests;
+
 const SOCKET_PERMISSION_MODE: u32 = 0o600;
 pub(super) const CONNECTION_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub(super) const APP_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -64,18 +67,13 @@ pub(crate) fn start_server_with_stop_control(
     start_server_inner(api_tx, event_hub, default_capabilities(), Some(server_stop))
 }
 
-pub fn start_server_with_capabilities(
-    api_tx: ApiRequestSender,
-    event_hub: EventHub,
-    capabilities: Option<ServerCapabilities>,
-) -> std::io::Result<ServerHandle> {
-    start_server_inner(api_tx, event_hub, capabilities, None)
-}
-
 fn default_capabilities() -> Option<ServerCapabilities> {
     Some(ServerCapabilities {
         live_handoff: crate::platform::capabilities().live_handoff,
         detached_server_daemon: crate::platform::current_process_is_detached_server_daemon(),
+        endpoint_protocol_generation: Some(crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION),
+        surface_interest: true,
+        health_check: true,
     })
 }
 
@@ -182,10 +180,23 @@ fn handle_connection_with_stop(
     let request = match serde_json::from_str::<Request>(line) {
         Ok(request) => request,
         Err(request_error) => {
+            // Recover correlation without relaxing typed request validation or accepting
+            // ambiguous duplicate IDs. Invalid JSON and non-string IDs stay uncorrelated.
+            #[derive(serde::Deserialize)]
+            struct RequestId {
+                id: String,
+            }
+            let id = if line.starts_with('{') {
+                serde_json::from_str::<RequestId>(line)
+                    .map(|request| request.id)
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
             write_json_line_allow_disconnect(
                 &mut stream,
                 &ErrorResponse {
-                    id: String::new(),
+                    id,
                     error: ErrorBody {
                         code: "invalid_request".into(),
                         message: format!("invalid request: {request_error}"),
@@ -359,6 +370,14 @@ fn handle_request(
         });
     }
 
+    if matches!(&request.method, Method::ClientShellSurfaceSet(_)) {
+        return error_response_json(
+            request.id,
+            "connection_local_only",
+            "client_shell.surface.set is only available through a client shell endpoint".into(),
+        );
+    }
+
     if matches!(&request.method, Method::ServerStop(_)) {
         if let Some(server_stop) = server_stop {
             server_stop.store(true, Ordering::Release);
@@ -376,10 +395,10 @@ fn handle_request(
         );
     }
 
-    dispatch_to_app(request, api_tx, None, response_write_complete, None)
+    dispatch_to_app(request, api_tx, None, response_write_complete, None, None)
 }
 
-fn api_method_name(method: &Method) -> &'static str {
+pub(crate) fn api_method_name(method: &Method) -> &'static str {
     match method {
         Method::Ping(_) => "ping",
         Method::ServerStop(_) => "server.stop",
@@ -388,8 +407,12 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::ServerAgentManifests(_) => "server.agent_manifests",
         Method::ServerReloadAgentManifests(_) => "server.reload_agent_manifests",
         Method::NotificationShow(_) => "notification.show",
+        Method::ProductAnnouncementDismiss(_) => "product_announcement.dismiss",
+        Method::ReleaseNotesDismiss(_) => "release_notes.dismiss",
+        Method::CommandInvoke(_) => "command.invoke",
         Method::ClientWindowTitleSet(_) => "client.window_title.set",
         Method::ClientWindowTitleClear(_) => "client.window_title.clear",
+        Method::ClientShellSurfaceSet(_) => "client_shell.surface.set",
         Method::SessionSnapshot(_) => "session.snapshot",
         Method::WorkspaceCreate(_) => "workspace.create",
         Method::WorkspaceList(_) => "workspace.list",
@@ -436,11 +459,19 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::PaneEdges(_) => "pane.edges",
         Method::PaneFocusDirection(_) => "pane.focus_direction",
         Method::PaneResize(_) => "pane.resize",
+        Method::PaneScroll(_) => "pane.scroll",
+        Method::PaneClear(_) => "pane.clear",
+        Method::PaneEditScrollback(_) => "pane.edit_scrollback",
+        Method::PaneSelectionRead(_) => "pane.selection.read",
+        Method::PaneCopyMotion(_) => "pane.copy_motion",
+        Method::PaneCopySearch(_) => "pane.copy_search",
         Method::PaneList(_) => "pane.list",
         Method::PaneCurrent(_) => "pane.current",
         Method::PaneGet(_) => "pane.get",
         Method::PaneFocus(_) => "pane.focus",
         Method::PaneInputSet(_) => "pane.input.set",
+        Method::PaneLinkActivate(_) => "pane.link.activate",
+        Method::PaneLinkResolve(_) => "pane.link.resolve",
         Method::PaneRename(_) => "pane.rename",
         Method::PaneSendText(_) => "pane.send_text",
         Method::PaneSendKeys(_) => "pane.send_keys",
@@ -464,6 +495,7 @@ fn api_method_name(method: &Method) -> &'static str {
         Method::EventsSubscribe(_) => "events.subscribe",
         Method::EventsWait(_) => "events.wait",
         Method::PaneWaitForOutput(_) => "pane.wait_for_output",
+        Method::IntegrationList(_) => "integration.list",
         Method::IntegrationInstall(_) => "integration.install",
         Method::IntegrationUninstall(_) => "integration.uninstall",
         Method::PluginLink(_) => "plugin.link",
@@ -703,7 +735,8 @@ fn stream_subscriptions(
             event_start_sequence,
         ) {
             Ok(active) => active,
-            Err(response) => {
+            Err(mut response) => {
+                response.id = request_id;
                 if let Err(err) = write_json_line(&mut stream, &response) {
                     if is_connection_closed_error(&err) {
                         return Ok(());
@@ -719,7 +752,7 @@ fn stream_subscriptions(
     if let Err(err) = write_json_line(
         &mut stream,
         &SuccessResponse {
-            id: request_id,
+            id: request_id.clone(),
             result: ResponseResult::SubscriptionStarted {},
         },
     ) {
@@ -735,7 +768,23 @@ fn stream_subscriptions(
         }
 
         for subscription in &mut subscriptions {
-            if let Some(event) = subscription.poll(api_tx, event_hub) {
+            let events = match subscription.poll_batch(api_tx, event_hub) {
+                Ok(events) => events,
+                Err(error) => {
+                    write_json_line_allow_disconnect(
+                        &mut stream,
+                        &ErrorResponse {
+                            id: request_id,
+                            error,
+                        },
+                    )?;
+                    return Ok(());
+                }
+            };
+            for event in events {
+                if should_stop_connection(&mut stream, running)? {
+                    return Ok(());
+                }
                 if let Err(err) = write_json_line(&mut stream, &event) {
                     if is_connection_closed_error(&err) {
                         return Ok(());
@@ -795,7 +844,22 @@ pub(super) fn dispatch_to_app_with_timeout(
     api_tx: &ApiRequestSender,
     timeout: Option<Duration>,
 ) -> String {
-    dispatch_to_app(request, api_tx, timeout, None, None)
+    dispatch_to_app(request, api_tx, timeout, None, None, None)
+}
+
+pub(super) fn dispatch_to_app_with_caller_timeout(
+    request: Request,
+    api_tx: &ApiRequestSender,
+    timeout: Option<Duration>,
+) -> String {
+    dispatch_to_app(
+        request,
+        api_tx,
+        timeout,
+        None,
+        None,
+        Some(("timeout", "timed out waiting for agent status")),
+    )
 }
 
 pub(super) fn dispatch_stream_open(
@@ -804,7 +868,7 @@ pub(super) fn dispatch_stream_open(
     timeout: Duration,
     active: Arc<AtomicBool>,
 ) -> String {
-    dispatch_to_app(request, api_tx, Some(timeout), None, Some(active))
+    dispatch_to_app(request, api_tx, Some(timeout), None, Some(active), None)
 }
 
 pub(super) fn dispatch_stream_frame(
@@ -818,6 +882,7 @@ pub(super) fn dispatch_stream_frame(
         Some(crate::app::pane_graphics::DIRECT_OUTER_TIMEOUT),
         None,
         Some(active),
+        None,
     )
 }
 
@@ -827,6 +892,7 @@ fn dispatch_to_app(
     timeout: Option<Duration>,
     response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
     stream_active: Option<Arc<AtomicBool>>,
+    timeout_response: Option<(&str, &str)>,
 ) -> String {
     let request_id = request.id.clone();
     let request_active = stream_active.clone();
@@ -872,6 +938,11 @@ fn dispatch_to_app(
             if let Some(active) = request_active {
                 active.store(false, Ordering::Release);
             }
+            if err.kind() == std::io::ErrorKind::TimedOut {
+                if let Some((code, message)) = timeout_response {
+                    return error_response_json(request_id, code, message.into());
+                }
+            }
             error_response_json(
                 request_id,
                 "server_unavailable",
@@ -879,6 +950,26 @@ fn dispatch_to_app(
             )
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn caller_timeout_dispatch_uses_timeout_error() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let response = dispatch_to_app_with_caller_timeout(
+        Request {
+            id: "prompt-timeout".into(),
+            method: Method::AgentPrompt(crate::api::schema::AgentPromptParams {
+                target: "reviewer".into(),
+                text: "review this".into(),
+                wait: None,
+            }),
+        },
+        &tx,
+        Some(Duration::ZERO),
+    );
+    let error: ErrorResponse = serde_json::from_str(&response).unwrap();
+    assert_eq!(error.error.code, "timeout");
 }
 
 fn error_response_json(id: String, code: &str, message: String) -> String {
@@ -900,7 +991,7 @@ mod tests {
     use super::*;
     use interprocess::local_socket::traits::Listener as _;
     use std::collections::HashMap;
-    use std::io::{BufRead, BufReader};
+    use std::io::{BufRead, BufReader, Read};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::UnixListener;
     use std::sync::{Mutex, OnceLock};
@@ -946,6 +1037,7 @@ mod tests {
             focused: true,
             cwd: None,
             foreground_cwd: None,
+            restore_error: None,
             label: None,
             agent: Some("pi".into()),
             title: None,
@@ -1088,6 +1180,11 @@ mod tests {
             Some(ServerCapabilities {
                 live_handoff: true,
                 detached_server_daemon: true,
+                endpoint_protocol_generation: Some(
+                    crate::protocol::endpoint::ENDPOINT_PROTOCOL_GENERATION,
+                ),
+                surface_interest: true,
+                health_check: true,
             }),
             None,
             None,
@@ -1376,6 +1473,95 @@ mod tests {
     }
 
     #[test]
+    fn invalid_requests_preserve_only_unambiguous_string_ids() {
+        let cases = [
+            (
+                r#"{"id":"mine","method":"pane.report_agent","params":{"pane_id":"w1:p1","status":"working","source":"x"}}"#,
+                "mine",
+            ),
+            (r#"{"id":"escaped\"id","method":"unknown"}"#, "escaped\"id"),
+            (r#"{"method":"unknown","params":{"id":"nested"}}"#, ""),
+            (r#"{"id":123,"method":"unknown"}"#, ""),
+            (
+                r#"{"id":"first","id":"second","method":"ping","params":{}}"#,
+                "",
+            ),
+            (r#"{"id":"truncated","method":"ping""#, ""),
+            (r#"["not-an-object"]"#, ""),
+        ];
+        for (request, expected_id) in cases {
+            let (api_tx, mut api_rx) = mpsc::unbounded_channel();
+            let (mut client, server, path) = local_stream_pair("invalid-request-id");
+            writeln!(client, "{request}").unwrap();
+            let running = Arc::new(AtomicBool::new(true));
+            handle_connection(server, &api_tx, &EventHub::default(), &running, None).unwrap();
+
+            let mut response = String::new();
+            BufReader::new(client)
+                .read_to_string(&mut response)
+                .unwrap();
+            let response: ErrorResponse = serde_json::from_str(&response).unwrap();
+            assert_eq!(response.id, expected_id, "{request}");
+            assert_eq!(response.error.code, "invalid_request");
+            assert!(response.error.message.starts_with("invalid request: "));
+            assert!(
+                api_rx.try_recv().is_err(),
+                "invalid requests must not dispatch"
+            );
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn subscription_setup_errors_preserve_request_id_and_reject_entire_stream() {
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let event_hub = EventHub::default();
+        let responder_event_hub = event_hub.clone();
+        let responder = std::thread::spawn(move || {
+            let msg = api_rx.blocking_recv().unwrap();
+            let Method::PaneGet(params) = msg.request.method else {
+                panic!("unexpected request: {:?}", msg.request.method);
+            };
+            assert_eq!(params.pane_id, "w999:p9");
+            responder_event_hub.push(crate::api::schema::EventEnvelope {
+                event: crate::api::schema::EventKind::PaneClosed,
+                data: crate::api::schema::EventData::PaneClosed {
+                    pane_id: "w999:p9".into(),
+                    workspace_id: "w999".into(),
+                },
+            });
+            msg.respond_to
+                .send(error_response_json(
+                    msg.request.id,
+                    "pane_not_found",
+                    "pane w999:p9 not found".into(),
+                ))
+                .unwrap();
+            assert!(
+                api_rx.blocking_recv().is_none(),
+                "rejection must not start polling"
+            );
+        });
+        let (mut client, server, path) = local_stream_pair("subscription-error-id");
+        let request = r#"{"id":"panefold:events","method":"events.subscribe","params":{"subscriptions":[{"type":"workspace.created"},{"type":"pane.closed"},{"type":"pane.agent_status_changed","pane_id":"w999:p9"}]}}"#;
+        writeln!(client, "{request}").unwrap();
+        let running = Arc::new(AtomicBool::new(true));
+        handle_connection(server, &api_tx, &event_hub, &running, None).unwrap();
+        drop(api_tx);
+        responder.join().unwrap();
+
+        let mut response = String::new();
+        BufReader::new(client)
+            .read_to_string(&mut response)
+            .unwrap();
+        let response: ErrorResponse = serde_json::from_str(&response).unwrap();
+        assert_eq!(response.id, "panefold:events");
+        assert_eq!(response.error.code, "pane_not_found");
+        assert_eq!(response.error.message, "pane w999:p9 not found");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn subscriptions_stop_when_client_disconnects() {
         let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
         let (mut client, server, _path) = local_stream_pair("api-sub-disconnect");
@@ -1399,6 +1585,7 @@ mod tests {
         let ack = read_line(&mut client);
         let ack: serde_json::Value = serde_json::from_str(&ack).unwrap();
         assert_eq!(ack["result"]["type"], "subscription_started");
+        assert_eq!(ack["id"], "sub_1");
 
         drop(client);
 

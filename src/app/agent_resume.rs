@@ -233,6 +233,15 @@ impl App {
             return false;
         };
 
+        if !cwd.is_dir() {
+            if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
+                terminal.pending_agent_resume_plan = None;
+                terminal.restore_error = Some("Saved directory is unavailable. Restore the directory and restart this session.".into());
+                terminal.revision = terminal.revision.saturating_add(1);
+            }
+            return true;
+        }
+
         let runtime = match crate::terminal::TerminalRuntime::spawn(
             pane_id,
             rows,
@@ -257,9 +266,11 @@ impl App {
                     "failed to start shell for deferred agent resume"
                 );
                 if let Some(terminal) = self.state.terminals.get_mut(&terminal_id) {
-                    terminal.clear_agent_runtime_identity_after_respawn();
+                    terminal.pending_agent_resume_plan = None;
+                    terminal.restore_error = Some(format!("Could not start the saved shell: {err}. Fix the shell configuration and restart this session."));
+                    terminal.revision = terminal.revision.saturating_add(1);
                 }
-                return false;
+                return true;
             }
         };
 
@@ -289,7 +300,7 @@ impl App {
 fn derived_pending_agent_resume_pane_infos(
     tab: &crate::workspace::Tab,
     terminal_area: Rect,
-    pane_borders: bool,
+    pane_borders: crate::config::PaneBordersConfig,
     pane_gaps: bool,
     pane_outer_borders: bool,
 ) -> Vec<crate::layout::PaneInfo> {
@@ -357,7 +368,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         App::new(
             &crate::config::Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -376,6 +387,49 @@ mod tests {
             "-c".into(),
             "printf '%s' 'restored agent: shell quoted | marker'; sleep 5".into(),
         ]
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_deferred_restore_keeps_session_reference_without_retrying_elsewhere() {
+        for missing_shell in [false, true] {
+            let mut app = test_app();
+            let workspace = crate::workspace::Workspace::test_new("unavailable");
+            let pane_id = workspace.tabs[0].root_pane;
+            let terminal_id = workspace.terminal_id(pane_id).unwrap().clone();
+            app.state.workspaces = vec![workspace];
+            app.state.active = Some(0);
+            app.state.ensure_test_terminals();
+            if missing_shell {
+                app.state.default_shell = "__herdr_missing_resume_shell__".into();
+            }
+            let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+            if !missing_shell {
+                terminal.cwd = std::env::current_dir()
+                    .unwrap()
+                    .join("__herdr_missing_resume_cwd__");
+                assert!(!terminal.cwd.exists());
+            }
+            let session = crate::agent_resume::PersistedAgentSession {
+                source: "herdr:codex".into(),
+                agent: "codex".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("resume-test").unwrap(),
+            };
+            terminal.persisted_agent_session = Some(session.clone());
+            terminal.pending_agent_resume_plan = Some(crate::agent_resume::AgentResumePlan {
+                agent: "codex".into(),
+                argv: long_running_test_argv(),
+                dedupe_key: "resume-test".into(),
+            });
+            app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true);
+            assert!(app.terminal_runtimes.get(&terminal_id).is_none());
+            let terminal = &app.state.terminals[&terminal_id];
+            assert!(terminal.pending_agent_resume_plan.is_none());
+            assert_eq!(terminal.persisted_agent_session.as_ref(), Some(&session));
+            assert!(terminal.restore_error.is_some());
+            assert!(!app.has_pending_agent_resumes());
+            assert!(!app.start_pending_agent_resume_for_terminal(&terminal_id, 24, 80, true));
+        }
     }
 
     #[cfg(unix)]
