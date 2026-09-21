@@ -30,16 +30,21 @@ aliases = []
 # "\u21E2" delegate) and must never be read as activity. The confirm dialog
 # marks the selected row with "> " (other pickers use "\u276F").
 #
-# KNOWN GAP - blocked is not reliably reported while a confirm dialog is up.
-# The dialog is built by the interrupt-approval handler, which keeps the
-# session in its running state, so TerminalTitleUpdater keeps writing braille
-# spinner frames and osc_title_working (priority 1100) outranks every blocked
-# rule here (max 980). Other manifests give an OSC-title blocker 1200-1400 for
-# exactly this reason (codex, grok, qwen, hermes, amp, letta). The dialog also
-# renders its own top rule and marks option shortcuts as "(shift + tab)" and
-# "(escape)", so it carries no "esc to cancel" for live_blocked_form or
-# generic_permission_prompt to key on, and neither of those rules can see it in
-# after_last_horizontal_rule. See CODEBUDDY.md for the verification needed.
+# The confirm dialog REPLACES the input box, it does not stack above it, so
+# while it is open after_last_horizontal_rule resolves to the dialog body and
+# the bare ">" prompt line disappears. Both facts are load-bearing: they are
+# why confirm_dialog_blocked can read the dialog from the bottom region, and
+# why the idle-prompt guard on legacy_no_prompt_blocker does not suppress it.
+#
+# KNOWN WART - the two whole_recent blockers (bash_permission_prompt,
+# legacy_no_prompt_blocker) are broad by design and can fire on transcript text
+# that merely quotes a dialog. They are kept only as fallbacks behind
+# confirm_dialog_blocked, which is scoped to the bottom hint region. Note that
+# bash_permission_prompt's "do you want to proceed?" needle does not match the
+# high-risk shape at all: the risk reason is spliced in before the "?".
+# live_blocked_form and generic_permission_prompt key on Claude's
+# "esc to cancel" / "enter to select" copy, which CodeBuddy's confirm dialog
+# does not render, so they never claim it.
 
 [[rules]]
 id = "osc_title_working"
@@ -98,6 +103,43 @@ any = [
     { contains = ["arrows to navigate"] },
     { contains = ["↑/↓ to navigate"] },
     { contains = ["↑↓ to navigate"] },
+  ] },
+]
+
+[[rules]]
+id = "confirm_dialog_blocked"
+state = "blocked"
+priority = 1200
+region = "after_last_horizontal_rule"
+visible_blocker = true
+# The interrupt-approval dialog replaces the input box, so its own footer rule
+# becomes the last horizontal rule and this region is exactly the dialog body.
+# Captured live from CodeBuddy 2.156.0 in default permission mode (rm -rf on a
+# scratch path):
+#    |  Do you want to proceed(High risk operation detected - requires confirmation every time)?
+#    |  > 1. Yes
+#    |    2. Yes, and don't ask again for session (shift + tab)
+#    |    3. No, and tell CodeBuddy what to do differently (escape)
+# The confirm title splices the risk reason in before the "?", so a literal
+# "do you want to proceed?" needle misses this high-risk shape entirely; match
+# the title family and require the numbered option block as the shape
+# condition. The option block is what keeps an idle pane or a transcript that
+# merely quotes the dialog from matching: in both cases this region holds only
+# the status line and the mode badge, never numbered options.
+# Priority sits above osc_title_working (1100) because the title keeps writing
+# braille spinner frames while the dialog waits, which otherwise masks the
+# blocker. codex, grok, qwen, hermes, amp and letta raise an OSC-title blocker
+# above 1100 for the same reason.
+all = [
+  { any = [
+    { line_regex = ['(?i)^\s*[>❯]?\s*1\.\s*yes\b'] },
+    { line_regex = ['(?i)^\s*[>❯]?\s*2\.\s*yes\b'] },
+    { line_regex = ['(?i)^\s*[>❯]?\s*3\.\s*no\b'] },
+  ] },
+  { any = [
+    { contains = ["do you want to"] },
+    { contains = ["would you like to"] },
+    { contains = ["about to delete"] },
   ] },
 ]
 

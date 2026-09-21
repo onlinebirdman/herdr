@@ -51,30 +51,66 @@ ZIG=/path/to/zig-0.16 cargo build --release
 - `contains` 匹配器是**大小写不敏感**的（`lower_text.contains(needle)`），所以 `"showing detailed transcript"` 能匹配 CodeBuddy 实际渲染的 `Showing detailed transcript \xB7 ctrl+o to toggle`。
 - `tab to amend` / `ctrl+e to explain` 在 2.156.0 中查无此文案，属沿用自 Claude 的常量；保留作为前向兼容，当前不会命中。
 
-## 已知缺口：blocked 在弹窗期间不可靠
+## blocked 在弹窗期间不可靠（已实机复现并修复）
 
 症状：CodeBuddy 停在权限确认弹窗上时，herdr 报 `working`，看不出它在等人。这个症状在 firstmate 侧已被实证两次（2026-09-15 ryfund、2026-09-16 Pi 权限策略 worker，见其 `cb-dialog-item.md`）。
 
-根因是三层叠加，**主因是规则优先级掩蔽**，不是我先前以为的 region：
+### 实测复现（2026-09-21，CodeBuddy 2.156.0 + herdr 0.9.1）
 
-1. **优先级掩蔽（决定性）**：引擎取**优先级最高**的命中规则（`manifest.rs:482-485`，blocked 没有任何特殊加权）。本 manifest 里 blocked 最高只有 980，而 `osc_title_working` 是 1100 → 只要 braille spinner 还在写，无论 blocked 规则命中与否都会输。实测印证：停在弹窗时 herdr 报 `working`，说明弹窗期间标题确实还在转（`TerminalTitleUpdater` 由 run state 驱动，interrupt-approval 未结束该回合）。
-   上游其它 manifest 正是为此把 OSC-title blocker 抬到 1200-1400：`letta` 1400、`grok` 1300、`qwen` 1200、`amp`/`codex`/`hermes` 1100。CodeBuddy 与 Claude 的优先级形状相同（blocked 最高都是 980），差别只在弹窗期间标题是否继续转 spinner；Claude 那边未独立验证。
-2. **`live_blocked_form` / `generic_permission_prompt` 两条都够不着**：region 是 `after_last_horizontal_rule`，实测该区域等于状态行 + 模式徽标（输入框的上下边框就是那两条水平线）；且两条都 `contains = ["esc to cancel"]`，而对话框不渲染该文案。
-3. **兜底规则挂在 `whole_recent` 上**：`bash_permission_prompt`（850）的 `any` 是 Bash 专属文案，只覆盖 Bash 类确认（标题 `Bash command`），Read/Write/Edit/Fetch 类不命中；`legacy_no_prompt_blocker`（300）面很宽（`do you want to` + `yes`），唯一的假阳性防线是空闲输入框守卫，而该守卫在弹窗期间是否有效见下面第 2 条待测项。
+在一个 `--permission-mode default` 的临时 tab 里让 codebuddy 跑 `rm -rf <scratch>/probe-rm`，弹窗期间抓到的屏幕：
 
-即使某一层修好，第 1 层的 1100 仍会盖住它，所以必须一起改。
+```
+● Bash(rm -rf /Users/.../cb-blocked-probe/scratch/probe-rm)
+────────────…（对话框上边框）
+ Bash command
+   rm -rf /Users/.../cb-blocked-probe/scratch/probe-rm
+   Remove probe-rm directory
+────────────…（对话框 footer 上边框）
+ Do you want to proceed(High risk operation detected - requires confirmation every time)?
+ > 1. Yes
+   2. Yes, and don't ask again for session (shift + tab)
+   3. No, and tell CodeBuddy what to do differently (escape)
+```
 
-### 需要一次实机验证才能定稿
+此时 herdr 报 `working`，标题仍在转 `⠸`，但 `probe-rm` 目录还在（命令没执行）。**Bug 稳定复现。**
 
-必须在一个**默认权限模式**的 codebuddy 会话里触发一次确认弹窗，用 `herdr agent explain <pane> --json` 抓两件事：
+### 根因（修正我早先的误判）
 
-- **弹窗渲染在哪**：`above_prompt_box`（会话区，即 `whole_recent` 能覆盖）还是输入框**下方**。这决定新规则的 region。
-- **弹窗期间输入框 region 是什么**：`prompt_box_body` 是否仍是裸 `>`。若不是，`legacy_no_prompt_blocker` 的 `not` 守卫不会误伤；若仍是，则该守卫会把兜底规则也压掉（这是本轮把守卫从 `❯` 改成 `[>❯]` 后引入的未验证交互，方向上是拿"空闲误报 blocked"换"blocked 漏报"，需要实测确认哪边更靠得住）。
+关键在于：**弹窗是替换掉输入框的，不是叠在它上面**。所以弹窗打开时裸 `>` 提示行消失，而 `after_last_horizontal_rule` 恰好解析成弹窗正文。这修正了我先前"对话框渲染在输入框上方、该 region 看不到它"的推断 - region 从来不是问题。
 
-定稿方向（有上游先例，但在拿到上述两条读数前不要落地）：
+真正的三层原因：
 
-- region 限定在**底部提示区**，不要用 `whole_recent`。firstmate 那份笔记记录过反向误报：一个健康 worker 因为**输出正文里引用了弹窗文案**（"Do you want to proceed (High risk...)"）就被判成"停在弹窗"，根因就是扫了整块区域。判定应带**形状条件**（编号选项行 `> 1. Yes` 之类 + 同屏文案），否则任何"提到弹窗文案"的 worker 都会被误判。
-- 给 blocked 规则优先级 **> 1100**，照 `codex` / `grok` / `qwen` / `hermes` / `amp` / `letta` 的先例。
+1. **优先级掩蔽（决定性）**：引擎取优先级最高的命中规则（`manifest.rs:482-485`，blocked 没有特殊加权）。弹窗期间 `TerminalTitleUpdater` 继续写 braille spinner，`osc_title_working`（1100）命中；而本 manifest 里 blocked 最高只有 980 → 无论 blocked 规则命中与否都会输。上游其它 manifest 正是为此把 blocker 抬到 1200-1400（`letta` 1400、`grok` 1300、`qwen` 1200、`amp`/`codex`/`hermes` 1100）。
+2. **现有 blocked 规则没有一条能匹配这个弹窗**（实测全部 `matched=false`）：
+   - `live_blocked_form` / `generic_permission_prompt`：region 是**对的**（实测预览就是上面那段弹窗正文），但 `contains` 用的是 Claude 的 `esc to cancel` / `enter to select`，而 CodeBuddy 只渲染每个选项后面的 `(shift + tab)` / `(escape)`。
+   - `bash_permission_prompt`：`contains = ["do you want to proceed?"]` **匹配不上高风险形态** - 风险原因被插在 `?` 前面，实际文本是 `proceed(High risk...)?`。低风险 Bash（无 reason）才会渲染成 `proceed?`。
+   - `legacy_no_prompt_blocker`：实测 `matched=true`（`do you want to` + `1. Yes`），但优先级只有 300。
+3. **`whole_recent` 兜底有误报风险**：firstmate 那份笔记记录过反向误报 - 一个健康 worker 因为输出正文里引用了弹窗文案（"Do you want to proceed (High risk...)"）就被判成"停在弹窗"，根因就是扫了整块区域。
 
-另外 `dynamic_workflow_prompt`、`model_picker_menu`、`transcript_viewer` 也还没做过实机触发验证。
+### 修复
+
+新增 `confirm_dialog_blocked`（priority **1200**，region `after_last_horizontal_rule`），用"编号选项行 `[>❯]?\s*[1-3]\.\s*(yes|no)`"作**形状条件**，再要求同屏出现标题族文案（`do you want to` / `would you like to` / `about to delete`）。
+
+- 高优先级解决第 1 层。
+- 底部 region + 形状条件解决第 3 层：idle 时该 region 只有状态行和模式徽标，绝不会出现编号选项；所以正文里引用弹窗文案不会被误判。
+- 实测还顺带回答了先前挂起的疑问：弹窗期间输入框被替换、裸 `>` 消失，所以 `legacy_no_prompt_blocker` 的 `not` 守卫**不会**在弹窗期间误伤（实测该规则 `matched=true`）。把守卫从 `❯` 改成 `[>❯]` 是安全的。
+
+### 验证结果
+
+| 场景 | 修复前 | 修复后 |
+|---|---|---|
+| 弹窗停在 High risk Bash 确认 | `working`（matched `osc_title_working`） | **`blocked`**（matched `confirm_dialog_blocked`，1200 压过 1100） |
+| 按 Escape 拒绝后 | - | `idle`（`live_prompt_box` + `osc_title_idle`），弹窗规则不再命中 |
+| 2 个空闲 pane | `idle` | `idle`，弹窗规则 `matched=false` |
+| 2 个工作中 pane | `working` | `working`，弹窗规则 `matched=false` |
+
+拒绝后确认 `probe-rm` 目录仍存在（命令确实没执行）。验证走的是本地 override + `herdr server reload-agent-manifests` 热重载，验证完 override 已删除。
+
+### 仍未验证
+
+- 其它形态的弹窗：`Write`/`Edit` 用 `Do you want to create …?` / `Do you want to make this edit to …?`，`Fetch` 用 `Do you want to allow … to fetch this content?`，批量删除用 `This command is about to delete N items.`。这些标题不含 `do you want to` 的常规形态，但 `about to delete` 已覆盖批量删除；其余几种需要用同样的方法各触发一次确认。
+- 渲染 `Esc to cancel` 那一类菜单（`live_blocked_form` 覆盖的 agents / skills picker）在弹窗期间是否也被 1100 掩蔽，未验证。
+- 工作区信任弹窗（`Do you trust the files in this folder`）未触发过 - 本次实验用的是已信任路径。
+- `dynamic_workflow_prompt`、`model_picker_menu`、`transcript_viewer` 仍未做过实机触发验证。
+
 
