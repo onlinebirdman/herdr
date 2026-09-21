@@ -1,8 +1,45 @@
 id = "codebuddy"
-version = "2026.08.10.1"
+version = "2026.09.21.1"
 min_engine_version = 2
-updated_at = "2026-08-10T00:00:00Z"
+updated_at = "2026-09-21T00:00:00Z"
 aliases = []
+
+# Evidence: CodeBuddy 2.156.0 CLI, verified against the shipped bundle and live
+# captures from Herdr panes (`herdr agent explain <pane> --json`).
+#
+# Terminal titles come from TerminalTitleUpdater, which writes
+#   process.stdout.write(`\x1B]0;${prefix} ${topic}\x07`)
+# with SPINNER_FRAMES = ["\u280B","\u2819","\u2839","\u2838","\u283C","\u2834",
+# "\u2826","\u2827","\u2807","\u280F"] while a turn is running and
+# IDLE_PREFIX = "\u2733" otherwise. Every frame is braille (U+2800-U+28FF), so
+# the title rules below stay braille-only; unlike Claude 2.1.228, CodeBuddy has
+# no half-circle busy spinner. Titles are suppressed entirely when
+# CODEBUDDY_CODE_DISABLE_TERMINAL_TITLE is set or stdout is not a TTY, which is
+# why the screen rules must also carry the working state.
+#
+# The live turn line above the input box uses the cli-spinners "star" animation,
+# frames ["\u2736","\u2738","\u2739","\u273A","\u2739","\u2737"] at 70ms, and
+# renders as `<frame> <action>\u2026 (<elapsed> \xB7 running <tool> \xB7 ...)`.
+# A finished turn instead renders as "\u2714 Worked for 9m 54s", so the star
+# glyphs do not linger once the turn ends.
+#
+# The input box body is a bare ">" and the status line below it is
+# "\u276F <cwd> \xB7 <model> \xB7 <elapsed>", followed by a mode badge line such
+# as "\u23F5\u23F5 bypass permissions on (shift+Tab to cycle)". Those glyphs are
+# persistent mode chrome (`\u23F8` plan, `\u23F5\u23F5` bypass/accept/auto,
+# "\u21E2" delegate) and must never be read as activity. The confirm dialog
+# marks the selected row with "> " (other pickers use "\u276F").
+#
+# KNOWN GAP - blocked is not reliably reported while a confirm dialog is up.
+# The dialog is built by the interrupt-approval handler, which keeps the
+# session in its running state, so TerminalTitleUpdater keeps writing braille
+# spinner frames and osc_title_working (priority 1100) outranks every blocked
+# rule here (max 980). Other manifests give an OSC-title blocker 1200-1400 for
+# exactly this reason (codex, grok, qwen, hermes, amp, letta). The dialog also
+# renders its own top rule and marks option shortcuts as "(shift + tab)" and
+# "(escape)", so it carries no "esc to cancel" for live_blocked_form or
+# generic_permission_prompt to key on, and neither of those rules can see it in
+# after_last_horizontal_rule. See CODEBUDDY.md for the verification needed.
 
 [[rules]]
 id = "osc_title_working"
@@ -11,6 +48,14 @@ priority = 1100
 region = "osc_title"
 visible_working = true
 regex = ['^[\x{2800}-\x{28FF}] ']
+
+[[rules]]
+id = "live_turn_working"
+state = "working"
+priority = 970
+region = "bottom_non_empty_lines(12)"
+visible_working = true
+line_regex = ['^\s*[\x{2736}-\x{273A}]\s+\S.*…(?:\s+\(\d+[smh](?:\s|·|$)|\s*$)']
 
 [[rules]]
 id = "btw_overlay_working"
@@ -70,7 +115,9 @@ state = "idle"
 priority = 950
 region = "prompt_box_body"
 visible_idle = true
-line_regex = ['^\s*❯']
+# CodeBuddy renders the input box as a bare ">" (the "\u276F" chevron belongs to
+# the status line below it), while Claude uses "\u276F". Accept both.
+line_regex = ['^\s*[>❯]']
 not = [
   { contains = ["enter to select"] },
   { contains = ["esc to cancel"] },
@@ -105,8 +152,24 @@ any = [
   { contains = ["tab to amend"] },
   { contains = ["ctrl+e to explain"] },
 ]
+# CodeBuddy's confirm dialog renders the selected row as "> " and every other
+# row as two spaces, so every option branch has to allow that prefix (#2650 is
+# the same cursor-position bug for Claude's "\u276F"). Numbered branches that
+# omit the prefix only match options the cursor has moved away from, which
+# leaves the resting layout unmatched:
+#   > 1. Yes / 2. Yes, allow reading from <dir> during this session / 3. No
+# Accept "\u276F" as well because other CodeBuddy lists (agents, models, skills)
+# use it as their pointer. Cover the two-option and the "don't ask again"
+# three-option shapes so this rule, not the narrower
+# generic_permission_prompt, claims approvals.
 all = [
-  { any = [{ line_regex = ['(?i)^\s*❯?\s*yes\b'] }, { line_regex = ['(?i)^\s*1\.\s*yes\b'] }, { line_regex = ['(?i)^\s*2\.\s*no\b'] }] },
+  { any = [
+    { line_regex = ['(?i)^\s*[>❯]?\s*yes\b'] },
+    { line_regex = ['(?i)^\s*[>❯]?\s*1\.\s*yes\b'] },
+    { line_regex = ['(?i)^\s*[>❯]?\s*2\.\s*yes\b'] },
+    { line_regex = ['(?i)^\s*[>❯]?\s*2\.\s*no\b'] },
+    { line_regex = ['(?i)^\s*[>❯]?\s*3\.\s*no\b'] },
+  ] },
 ]
 
 [[rules]]
@@ -118,10 +181,10 @@ visible_blocker = true
 contains = ["do you want to proceed?", "esc to cancel"]
 all = [
   { any = [
-    { line_regex = ['(?i)^\s*❯?\s*1\.\s*yes\b'] },
-    { line_regex = ['(?i)^\s*2\.\s*yes\b'] },
-    { line_regex = ['(?i)^\s*2\.\s*no\b'] },
-    { line_regex = ['(?i)^\s*3\.\s*no\b'] },
+    { line_regex = ['(?i)^\s*[>❯]?\s*1\.\s*yes\b'] },
+    { line_regex = ['(?i)^\s*[>❯]?\s*2\.\s*yes\b'] },
+    { line_regex = ['(?i)^\s*[>❯]?\s*2\.\s*no\b'] },
+    { line_regex = ['(?i)^\s*[>❯]?\s*3\.\s*no\b'] },
   ] },
 ]
 
@@ -142,7 +205,7 @@ any = [
   { contains = ["skip interview and plan immediately"] },
 ]
 not = [
-  { regex = ['(?m)^\s*❯\s*$'] },
+  { regex = ['(?m)^\s*[>❯]\s*$'] },
 ]
 
 [[rules]]
