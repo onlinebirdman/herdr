@@ -726,6 +726,7 @@ fn success_response_round_trips() {
                 endpoint_protocol_generation: Some(1),
                 surface_interest: true,
                 health_check: true,
+                ssh_agent_registration: false,
             }),
         },
     };
@@ -1457,4 +1458,10 @@ fn pane_link_resolve_round_trips() {
         serde_json::from_value::<ResponseResult>(json).unwrap(),
         result
     );
+}
+
+#[test]
+fn read_choices_cover_every_api_value() {
+    crate::cli::projection::assert_choices_cover_api_enum(READ_SOURCES);
+    crate::cli::projection::assert_choices_cover_api_enum(READ_FORMATS);
 }
