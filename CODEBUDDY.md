@@ -1,6 +1,6 @@
-# CodeBuddy 支持（本 fork 额外添加）
+# CodeBuddy 支持与本 fork 维护（本 fork 额外添加）
 
-本 fork 在官方 herdr 基础上，增加了对腾讯 **CodeBuddy**（CLI 命令 `codebuddy`）的 agent 检测支持，使 herdr 能识别正在运行的 CodeBuddy 会话，并在侧边栏显示其 working / blocked / idle 状态。
+本 fork 在官方 herdr 基础上，增加了对腾讯 **CodeBuddy**（CLI 命令 `codebuddy`）的 agent 检测支持，使 herdr 能识别正在运行的 CodeBuddy 会话，并在侧边栏显示其 working / blocked / idle 状态。本文档同时记录本 fork 的日常维护操作，重点是[同步上游操作手册](#同步上游操作手册runbook)。
 
 > 说明：官方仓库（herdrdev/herdr）截至本提交尚未合并 CodeBuddy 支持（相关 PR #1064 未合并，feature request 见 #567）。本 fork 自行维护该支持。
 
@@ -20,24 +20,62 @@
 - `distribution/agent-detection/codebuddy.toml` + `index.toml`
   - 上游新增了发布目录校验：凡 `BUNDLED_MANIFESTS` 里的 agent 都必须出现在 `distribution/agent-detection/`，否则 `just release-docs-check`（`scripts/agent_detection_manifest_check.py --require-all-published`）会失败。codebuddy 采用**正式发布**而非 `UNPUBLISHED_BUNDLED_MANIFESTS` 的 version+sha256 例外，因为例外一旦改动 manifest 就会失效。发布副本必须与 bundled 版本一致且**逐字节相同**，改动 `src/detect/manifests/codebuddy.toml` 后需同步 `cp` 过去。
 
-## 合并上游的注意点
+## 同步上游操作手册（runbook）
 
-上游每个版本都会新增 agent 变体（本轮是 `Letta`、`Muse`），`Agent::ALL` / `SCREEN_MANIFEST_AGENTS` 的长度常量会因此再次错位。`git merge upstream/master` 本身无冲突，但合并后这两个常量需要手工修正，否则编译失败。
+### 远程配置
+
+- `origin` = `git@github.com:onlinebirdman/herdr.git`（本 fork）
+- `upstream` = `git@github.com:herdrdev/herdr.git`（官方）
+
+### 操作步骤
+
+1. **拉取**：`git fetch upstream`
+2. **盘点新提交**：`git log --oneline HEAD..upstream/master | wc -l`，并用 `git log --oneline HEAD..upstream/master` 浏览（关注 `feat:` / `release:` 与 agent 检测相关提交）
+3. **冲突面分析**（合并前必做）：
+   - 本地改动文件：`git diff --name-only upstream/master...HEAD`
+   - 上游对同路径的改动：`git diff --name-only HEAD...upstream/master -- src/detect/ src/config/sound.rs distribution/agent-detection/`
+   - 上游是否动了 `Agent` 枚举本身：`git diff HEAD...upstream/master -- src/detect/mod.rs | grep -E 'enum Agent|ALL|SCREEN_MANIFEST'`
+4. **预演合并**（不碰工作区）：`git merge-tree --write-tree HEAD upstream/master`。exit 0 且只输出一个 tree OID = 无冲突；出现冲突标记则先人工分析
+5. **执行合并**：`git merge upstream/master --no-edit`
+6. **合并后必查**：
+   - **数组长度常量**：上游几乎每个版本都会新增 agent 变体，`Agent::ALL` / `SCREEN_MANIFEST_AGENTS` 的长度常量（`src/detect/mod.rs`）会因此错位，编译失败。数枚举变体数（注意别把 `AgentState` 的 4 个变体算进去），与 `[Self; N]` 对齐
+   - **codebuddy 三件套完好**：`src/detect/mod.rs` 的枚举变体与 `lookup_agent` 映射、`src/detect/manifest.rs` 的 `BUNDLED_MANIFESTS` 注册、`src/detect/manifests/codebuddy.toml` 与 `distribution/agent-detection/codebuddy.toml` 两个文件都在
+7. **发布目录校验**：`python3.11 scripts/agent_detection_manifest_check.py --require-all-published`（系统 `python3` 是 3.10、没有 `tomllib`，必须用 `python3.11`）
+8. **构建**：见[构建要求](#构建要求)。首次全量约 10 分钟（libghostty-vt 用 zig 编译 C++）
+9. **二进制自检**：`./target/release/herdr --version`，再 `./target/release/herdr agent list | grep codebuddy` 确认检测仍工作
+10. **测试**：`export PATH=~/.cargo/bin:$PATH && ZIG=~/zig-x86_64-macos-0.16.0/zig cargo nextest run --locked --retries 3 --no-fail-fast`
+    - 已知环境性 flaky（与本 fork 代码无关，直接运行对应测试二进制 100% 通过）：`api_ping` / `client_mode` / `remote_attach` 这三个集成测试会在测试进程里 spawn herdr 二进制，在本机沙箱的 nextest 深进程树下启动偶发超时。对 persistent failure 单独重跑该测试二进制确认即可
+    - 注意 plain `cargo test` 在本仓库不可用于全量验证：`src/cli.rs` 的 `print!`/`println!` 宏会调 `begin_cli_output()` 把 SIGPIPE 设为 `SIG_DFL` 且不恢复，测试进程遗留该配置后会被 SIGPIPE 杀死（nextest 每测试独立进程所以不触发）
+11. **推送**：`git push origin master`
+
+### 合并后的运行注意
+
+- `/usr/local/bin/herdr` 是指向 `target/release/herdr` 的符号链接，重新构建后 CLI 即时生效（版本号变化时旧 CLI 会与运行中的 server 协议不兼容，需重启 server）
+- **编译进二进制的 agent manifest 需要重启 server 才生效**。运行中的 server 仍是旧构建，合并涉及 manifest 变更（claude/codex/grok/pi/antigravity 等）时，重启 server 前要知会用户 - 重启会影响当前所有 pane
+
+### 本轮实测记录（2026-10-23，可作参照）
+
+- 范围 `5a649142..5bd900d8`，共 152 个提交，版本 v0.9.2 → v0.9.5
+- **零冲突**（`merge-tree` 预演干净）；merge commit `5af57cf5`
+- 上游本轮未新增 agent 变体，`Agent::ALL` = 25 / `SCREEN_MANIFEST_AGENTS` = 23 无需修正
+- 发布校验通过；release 构建通过；`agent list` 检出全部 8 个真实 codebuddy pane
+- nextest 全量 3908/3909 通过（唯一 persistent failure 为上述环境性 flaky 的 `remote_attach`）
+- 顺带修复了构建环境：系统 zig 因 Homebrew 删除 `llvm@21` 而损坏，改用官方静态版，见[构建要求](#构建要求)
 
 ## 构建要求
 
-herdr 内置的 `libghostty-vt` 需要 **Zig 0.16.0**（v0.9.1 起从 0.15.2 升级）。系统里的 `zig` 若已是 0.16，直接构建即可：
+herdr 内置的 `libghostty-vt` 需要 **Zig 0.16.0**（v0.9.1 起从 0.15.2 升级）。
+
+**当前机器状态（2026-10-23 起）**：系统 `/usr/local/bin/zig`（Homebrew zig 0.16.0_1）已损坏 - Homebrew 删除了 `llvm@21` keg，zig 一启动就 dyld 报错 `Library not loaded: /usr/local/opt/llvm@21/lib/libclang-cpp.dylib`（系统只剩 llvm 22）。已改用**官方静态链接版**，解压在家目录，构建必须显式指定：
 
 ```bash
-cargo build --release
+ZIG=~/zig-x86_64-macos-0.16.0/zig cargo build --release
 # 产物： ./target/release/herdr
 ```
 
-若 PATH 上的 `zig` 版本不对，用 `ZIG` 环境变量指向 0.16 的二进制：
+（若该目录丢失，从 <https://ziglang.org/download/0.16.0/zig-x86_64-macos-0.16.0.tar.xz> 重新下载解压。`cargo test` 首次构建 debug profile 同样需要这个 `ZIG`。）
 
-```bash
-ZIG=/path/to/zig-0.16 cargo build --release
-```
+若哪天 Homebrew 修好了或换了机器，`zig version` 能正常输出 `0.16.0` 时可直接 `cargo build --release`，否则用上面的 `ZIG` 环境变量指向 0.16 的二进制。
 
 ## 规则依据（已验证）
 
